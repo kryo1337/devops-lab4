@@ -90,18 +90,18 @@ jobs:
 
       - name: Docker Compose health check
         run: |
-          docker-compose up -d
+          docker compose up -d
           sleep 30
           
-          docker-compose ps
+          docker compose ps
           
           curl -f http://localhost:5000/health || exit 1
           
-          docker-compose exec -T db pg_isready -U clickuser -d clickdb || exit 1
+          docker compose exec -T db pg_isready -U clickuser -d clickdb || exit 1
           
           echo "All services are healthy"
           
-          docker-compose down
+          docker compose down
 
   deploy-docker:
     name: Deploy to Docker Compose
@@ -129,8 +129,8 @@ jobs:
 
       - name: Deploy with Docker Compose
         run: |
-          docker-compose down || true
-          docker-compose up -d
+          docker compose down || true
+          docker compose up -d
 
       - name: Wait for services to be ready
         run: |
@@ -150,7 +150,7 @@ jobs:
           echo "Deployment completed successfully!"
           echo "Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
           echo "URL: http://localhost:5000"
-          docker-compose ps
+          docker compose ps
 
   deploy-k8s:
     name: Deploy to Kubernetes
