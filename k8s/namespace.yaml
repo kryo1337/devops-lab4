@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: click-counter
+  labels:
+    name: click-counter
+    environment: production
+

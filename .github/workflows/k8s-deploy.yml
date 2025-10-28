@@ -1,0 +1,233 @@
+name: Kubernetes Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+      image_tag:
+        description: 'Image tag to deploy (default: latest)'
+        required: false
+        default: 'latest'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  deploy:
+    name: Deploy to Kubernetes (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    environment:
+      name: k8s-${{ inputs.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Configure kubectl
+        uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBE_CONFIG }}
+
+      - name: Verify cluster access
+        run: |
+          echo "🔍 Verifying cluster connection..."
+          kubectl cluster-info
+          kubectl version --short || kubectl version
+          kubectl get nodes
+
+      - name: Set namespace
+        id: namespace
+        run: |
+          if [ "${{ inputs.environment }}" == "production" ]; then
+            echo "namespace=click-counter" >> $GITHUB_OUTPUT
+          else
+            echo "namespace=click-counter-staging" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Prepare manifests
+        run: |
+          cd k8s
+          
+          # Update namespace
+          find . -name "*.yaml" -type f -exec sed -i "s/namespace: click-counter/namespace: ${{ steps.namespace.outputs.namespace }}/g" {} \;
+          
+          # Update image tag
+          sed -i "s|image: ghcr.io/USERNAME/REPO:latest|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.image_tag }}|g" web-deployment.yaml
+          
+          echo "Updated manifests:"
+          grep -n "namespace:" namespace.yaml || true
+          grep -n "image:" web-deployment.yaml
+
+      - name: Create namespace
+        run: |
+          kubectl get namespace ${{ steps.namespace.outputs.namespace }} || \
+          kubectl create namespace ${{ steps.namespace.outputs.namespace }}
+
+      - name: Store previous deployment state
+        id: previous
+        run: |
+          REVISION=$(kubectl rollout history deployment/web -n ${{ steps.namespace.outputs.namespace }} 2>/dev/null | tail -1 | awk '{print $1}' || echo "0")
+          echo "revision=$REVISION" >> $GITHUB_OUTPUT
+          echo "Previous revision: $REVISION"
+
+      - name: Apply Kubernetes manifests
+        run: |
+          echo "Deploying to ${{ steps.namespace.outputs.namespace }}..."
+          
+          # Configuration
+          kubectl apply -f k8s/configmap.yaml
+          kubectl apply -f k8s/secret.yaml
+          kubectl apply -f k8s/postgres-init-configmap.yaml
+          
+          # Storage
+          kubectl apply -f k8s/postgres-pvc.yaml
+          
+          # Database
+          kubectl apply -f k8s/postgres-deployment.yaml
+          kubectl apply -f k8s/postgres-service.yaml
+          
+          # Wait for database
+          echo "Waiting for database..."
+          kubectl wait --for=condition=ready pod -l component=database -n ${{ steps.namespace.outputs.namespace }} --timeout=300s
+          
+          # Application
+          kubectl apply -f k8s/web-deployment.yaml
+          kubectl apply -f k8s/web-service.yaml
+          
+          # Optional: Ingress and HPA
+          kubectl apply -f k8s/ingress.yaml || echo "Ingress not applied"
+          kubectl apply -f k8s/hpa.yaml || echo "HPA not applied"
+
+      - name: Wait for deployment
+        timeout-minutes: 5
+        run: |
+          echo "Waiting for web deployment rollout..."
+          kubectl rollout status deployment/web -n ${{ steps.namespace.outputs.namespace }} --timeout=300s
+
+      - name: Verify deployment health
+        run: |
+          echo "Verifying deployment health..."
+          
+          # Check pods are running
+          kubectl get pods -n ${{ steps.namespace.outputs.namespace }}
+          
+          # Check all web pods are ready
+          READY_PODS=$(kubectl get deployment web -n ${{ steps.namespace.outputs.namespace }} -o jsonpath='{.status.readyReplicas}')
+          DESIRED_PODS=$(kubectl get deployment web -n ${{ steps.namespace.outputs.namespace }} -o jsonpath='{.spec.replicas}')
+          
+          echo "Ready pods: $READY_PODS / $DESIRED_PODS"
+          
+          if [ "$READY_PODS" != "$DESIRED_PODS" ]; then
+            echo "Not all pods are ready!"
+            exit 1
+          fi
+          
+          echo "All pods are ready"
+
+      - name: Run health checks
+        run: |
+          echo "Running health checks..."
+          
+          # Port forward for testing
+          kubectl port-forward svc/web-service 8080:80 -n ${{ steps.namespace.outputs.namespace }} &
+          PF_PID=$!
+          sleep 10
+          
+          # Test health endpoint
+          for i in {1..5}; do
+            if curl -f http://localhost:8080/health; then
+              echo "Health check passed"
+              kill $PF_PID || true
+              exit 0
+            fi
+            echo "Attempt $i failed, retrying..."
+            sleep 5
+          done
+          
+          kill $PF_PID || true
+          echo "❌ Health check failed after 5 attempts"
+          exit 1
+
+      - name: Run smoke tests
+        run: |
+          echo "Running smoke tests..."
+          
+          kubectl port-forward svc/web-service 8080:80 -n ${{ steps.namespace.outputs.namespace }} &
+          PF_PID=$!
+          sleep 5
+          
+          # Test homepage
+          curl -f http://localhost:8080/ | grep "Click Counter" || { kill $PF_PID; exit 1; }
+          
+          # Test click functionality
+          RESPONSE=$(curl -s -X POST http://localhost:8080/click)
+          echo "Click response: $RESPONSE"
+          echo "$RESPONSE" | grep -q "clicks" || { kill $PF_PID; exit 1; }
+          
+          kill $PF_PID || true
+          echo "All smoke tests passed"
+
+      - name: Deployment summary
+        if: success()
+        run: |
+          echo "Deployment Successful!"
+          echo ""
+          echo "Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.image_tag }}"
+          echo "Namespace: ${{ steps.namespace.outputs.namespace }}"
+          echo "Environment: ${{ inputs.environment }}"
+          echo ""
+          echo "Resources:"
+          kubectl get all -n ${{ steps.namespace.outputs.namespace }}
+          echo ""
+          echo "Access application:"
+          echo "   kubectl port-forward svc/web-service 8080:80 -n ${{ steps.namespace.outputs.namespace }}"
+          echo "   Open: http://localhost:8080"
+
+      - name: Rollback on failure
+        if: failure() && steps.previous.outputs.revision != '0'
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "Deployment Failed - Initiating Rollback"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "Rolling back to revision ${{ steps.previous.outputs.revision }}..."
+          
+          kubectl rollout undo deployment/web -n ${{ steps.namespace.outputs.namespace }}
+          
+          echo "Waiting for rollback to complete..."
+          kubectl rollout status deployment/web -n ${{ steps.namespace.outputs.namespace }} --timeout=120s || true
+          
+          echo ""
+          echo "Current state after rollback:"
+          kubectl get pods -n ${{ steps.namespace.outputs.namespace }}
+          
+          echo "Deployment rolled back to previous version"
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          echo "Collecting logs for debugging..."
+          echo ""
+          echo "Recent Events"
+          kubectl get events -n ${{ steps.namespace.outputs.namespace }} --sort-by='.lastTimestamp' | tail -20
+          echo ""
+          echo "Web Pod Logs"
+          kubectl logs -l component=web -n ${{ steps.namespace.outputs.namespace }} --tail=50 || true
+          echo ""
+          echo "Database Pod Logs"
+          kubectl logs -l component=database -n ${{ steps.namespace.outputs.namespace }} --tail=50 || true
+

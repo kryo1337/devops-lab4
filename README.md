@@ -1,5 +1,8 @@
 # DevOps Lab 4
 
+![CI/CD Pipeline](https://github.com/USERNAME/REPO/actions/workflows/main.yml/badge.svg)
+![Kubernetes Deploy](https://github.com/USERNAME/REPO/actions/workflows/k8s-deploy.yml/badge.svg)
+
 ## Features
 
 - Click counter with persistent state (PostgreSQL)
@@ -32,3 +35,6 @@
 - Gunicorn (WSGI server)
 - Docker multi-stage build
 - Docker Compose
+- Kubernetes manifests with auto-scaling
+- GitHub Actions CI/CD with K8s deployment
+- Automated rollback on failure
