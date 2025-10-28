@@ -26,7 +26,7 @@ spec:
     spec:
       containers:
       - name: web
-        image: ghcr.io/kryo1337/devops_lab4:latest
+        image: ghcr.io/kryo1337/devops-lab4:latest
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 5000
